@@ -2,6 +2,7 @@ import rateLimit from 'express-rate-limit';
 import config from '../config/environment';
 import redisClient from '../config/redis';
 import logger from '../utils/logger';
+import { AuthRequest } from '../types';
 
 /**
  * Create rate limiter with Redis store
@@ -89,11 +90,60 @@ export const authLimiter = createRateLimiter(
 );
 
 /**
- * AI endpoint rate limiter
- * 20 requests per 15 minutes
+ * AI endpoint rate limiter — keyed by userId, not IP.
+ * Each authenticated user gets their own independent quota:
+ * 100 messages per hour.
  */
-export const aiLimiter = createRateLimiter(
-  15 * 60 * 1000, // 15 minutes
-  20,
-  'Too many AI requests, please try again later'
-);
+export const aiLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Use userId as the rate-limit key so every user has their own bucket.
+  // Falls back to IP for unauthenticated requests (shouldn't happen on auth'd routes).
+  keyGenerator: (req) => {
+    const userId = (req as AuthRequest).userId;
+    return userId ? `ai_user:${userId}` : (req.ip ?? 'unknown');
+  },
+  store: {
+    async increment(key: string): Promise<{ totalHits: number; resetTime: Date | undefined }> {
+      try {
+        const redis = redisClient.getClient();
+        const current = await redis.incr(key);
+        if (current === 1) {
+          await redis.expire(key, 60 * 60); // 1 hour TTL
+        }
+        const ttl = await redis.ttl(key);
+        return {
+          totalHits: current,
+          resetTime: ttl > 0 ? new Date(Date.now() + ttl * 1000) : undefined,
+        };
+      } catch (error) {
+        logger.error('AI rate limiter Redis error', error);
+        return { totalHits: 0, resetTime: undefined };
+      }
+    },
+    async decrement(key: string): Promise<void> {
+      try {
+        await redisClient.getClient().decr(key);
+      } catch (error) {
+        logger.error('AI rate limiter decrement error', error);
+      }
+    },
+    async resetKey(key: string): Promise<void> {
+      try {
+        await redisClient.del(key);
+      } catch (error) {
+        logger.error('AI rate limiter reset error', error);
+      }
+    },
+  },
+  handler: (req, res) => {
+    const userId = (req as AuthRequest).userId;
+    logger.warn('AI rate limit exceeded', { userId, path: req.path });
+    res.status(429).json({
+      success: false,
+      error: 'You have reached the limit of 100 AI messages per hour. Please try again later.',
+    });
+  },
+});
